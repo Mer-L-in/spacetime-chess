@@ -1,0 +1,8 @@
+{
+  "dev": {
+    "run": "cargo run"
+  },
+  "database": "spacetime-chess",
+  "server": "local",
+  "module-path": "./spacetimedb"
+}

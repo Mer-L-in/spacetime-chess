@@ -1,0 +1,13 @@
+[package]
+edition = "2024"
+name = "spacetime_chess"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+log = "0.4"
+spacetimedb = {version = "2.1.0"}

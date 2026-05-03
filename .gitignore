@@ -1,0 +1,10 @@
+# Rust
+target/
+Cargo.lock
+
+# SpacetimeDB generated bindings — regenerate with `spacetime generate`
+src/module_bindings/
+
+# IDE
+.vscode/
+.idea/
