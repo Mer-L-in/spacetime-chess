@@ -9,5 +9,7 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [dependencies]
+argon2 = "0.5"
 log = "0.4"
-spacetimedb = {version = "2.1.0"}
+rand_core = {version = "0.10.1"}
+spacetimedb = {version = "2.2.0"}

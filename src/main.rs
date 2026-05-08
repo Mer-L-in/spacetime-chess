@@ -287,7 +287,7 @@ fn auth_loop(conn: &DbConnection, state: &State) {
 }
 
 // ─────────────────────────────────────────────
-// REPL LOOP (FULL)
+// REPL LOOP
 // ─────────────────────────────────────────────
 
 fn repl_loop(conn: &DbConnection, state: &State) {

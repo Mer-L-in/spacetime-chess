@@ -1,3 +1,7 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use spacetimedb::{rand::RngCore, ReducerContext, SpacetimeType, Table, Timestamp};
 
 // ─────────────────────────────────────────────
@@ -55,7 +59,7 @@ pub struct User {
     pub user_id: u64,
     #[unique]
     pub username: String,
-    pub password_hash: u64,
+    pub password_hash: String,
     pub wins: u32,
     pub losses: u32,
     pub draws: u32,
@@ -197,16 +201,26 @@ pub struct DrawOffer {
 //  AUTH HELPERS
 // ─────────────────────────────────────────────
 
-/// FNV-64 hash — deterministic, no external deps, WASM-safe.
-fn hash_password(password: &str) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET;
-    for byte in password.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+pub fn hash_password(ctx: &ReducerContext, password: &str) -> Result<String, String> {
+    let mut salt_bytes = [0u8; 16];
+    ctx.rng().fill_bytes(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| e.to_string())?;
+
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| e.to_string())
+}
+
+pub fn verify_password(password: &str, password_hash: &str) -> Result<(), String> {
+    let parsed_hash =
+        PasswordHash::new(password_hash).map_err(|_| "Invalid username or password".to_string())?;
+
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .map_err(|_| "Invalid username or password".to_string())?;
+
+    Ok(())
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
@@ -835,7 +849,7 @@ pub fn register(ctx: &ReducerContext, username: String, password: String) -> Res
     let user = ctx.db.user().insert(User {
         user_id: 0,
         username: username.clone(),
-        password_hash: hash_password(&password),
+        password_hash: hash_password(&ctx, &password)?,
         wins: 0,
         losses: 0,
         draws: 0,
@@ -869,9 +883,7 @@ pub fn login(ctx: &ReducerContext, username: String, password: String) -> Result
         .find(&username)
         .ok_or("Invalid username")?;
 
-    if user.password_hash != hash_password(&password) {
-        return Err("Invalid username or password".to_string());
-    }
+    verify_password(&password, &user.password_hash)?;
 
     // --- PRIVATE SESSION ---
     if ctx.db.session().identity().find(ctx.sender()).is_some() {
@@ -929,15 +941,14 @@ pub fn change_password(
     new_password: String,
 ) -> Result<(), String> {
     let user = require_auth(ctx)?;
-    if user.password_hash != hash_password(&current_password) {
-        return Err("Current password is incorrect".to_string());
-    }
+    verify_password(&new_password, &user.password_hash)?;
     validate_password(&new_password)?;
     if current_password == new_password {
         return Err("New password must differ from current password".to_string());
     }
+    let pwd_hash = hash_password(&ctx, &new_password)?;
     ctx.db.user().user_id().update(User {
-        password_hash: hash_password(&new_password),
+        password_hash: pwd_hash.to_string(),
         ..user
     });
     Ok(())

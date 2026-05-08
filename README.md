@@ -6,10 +6,10 @@ A multiplayer chess game built on SpacetimeDB. Features account-based auth, matc
 
 ```
 .
-├── spacetimedb/src/lib.rs   ← SpacetimeDB server module (Rust)
-├── spacetimedb/Cargo.toml   ← Server dependencies (spacetimedb, argon2)
-├── src/main.rs              ← Rust CLI client
-└── Cargo.toml               ← Client dependencies (spacetimedb-sdk, rpassword)
+├── spacetimedb/src/lib.rs   ← Server module
+├── spacetimedb/Cargo.toml   ← Server dependencies
+├── src/main.rs              ← Client module
+└── Cargo.toml               ← Client dependencies
 ```
 
 ---
@@ -97,8 +97,6 @@ Alice> move e7 e8 Q     ← promotion
 | `passwd` | Change your password |
 | `whoami` | Show your username, user ID, and stats |
 
-Passwords are hashed with **Argon2id** on the server (19 MiB memory, 2 iterations). The plaintext password never leaves the client.
-
 ---
 
 ## Game Commands
@@ -122,51 +120,3 @@ Passwords are hashed with **Argon2id** on the server (19 MiB memory, 2 iteration
 | `chat <message>` | Send a message (in-game, or lobby chat when no game is active) |
 | `leaderboard` | Show player rankings by wins |
 | `quit` | Exit |
-
----
-
-## Server Schema
-
-| Table | Access | Purpose |
-|---|---|---|
-| `user` | public | Accounts — username, Argon2id hash, W/L/D stats |
-| `session` | private | Maps SpacetimeDB Identity → user_id (server-only) |
-| `lobby_entry` | public | Matchmaking queue |
-| `game` | public | One row per game, stores full FEN board state |
-| `move_record` | public | Append-only move history, indexed by game_id |
-| `spectator` | public | Who is watching which game |
-| `chat_message` | public | In-game and lobby chat, indexed by game_id |
-| `draw_offer` | public | Pending draw offers |
-
----
-
-## Architecture Notes
-
-**Auth** — Accounts are identity-independent: the same account can be logged into from any connection. The `session` table is private (server-only) and maps the current SpacetimeDB `Identity` to a `user_id`. Every game reducer calls `require_auth()` first. Sessions are cleaned up on disconnect.
-
-**Board state** — Stored as a FEN string in the `game` row. The full game state is always self-contained in a single row, making it easy to subscribe to and display.
-
-**Move history** — The `move_record` table is append-only. Each row stores the SAN notation for that move, so PGN export is built entirely client-side with no extra server calls.
-
-**Matchmaking** — Pairs the first two open lobby entries. Color assignment uses `ctx.rng()` (SpacetimeDB's deterministic RNG — required for reducer determinism).
-
-**Prompt reprinting** — Background threads (game updates, chat) reprint the `username> ` prompt after printing so the cursor is always at the bottom of the terminal.
-
----
-
-## Move Validation
-
-The server contains a self-contained chess engine that validates:
-
-- All piece movement rules
-- Captures and own-piece prevention
-- En passant
-- Castling (kingside and queenside, with rights tracking)
-- Pawn promotion (must specify piece on back rank)
-- Path blocking for sliding pieces
-- Check detection (rays, knights, pawns, king proximity)
-- Move rejected if it leaves own king in check
-
-**Not yet implemented (extension points in `lib.rs`):**
-- Full legal move enumeration for stalemate detection
-- Fifty-move rule and threefold repetition draw claims
