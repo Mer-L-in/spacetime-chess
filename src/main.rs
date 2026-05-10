@@ -12,7 +12,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -25,6 +25,17 @@ use std::env;
 use std::io::{self};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
+
+fn reducer_callback(state: &State, result: Result<Result<(), String>, impl std::fmt::Display>) {
+    let err_msg = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        Err(e) => Some(format!("Internal error: {e}")),
+    };
+    if let Some(msg) = err_msg {
+        state.lock().unwrap().push(LogMessage::error(msg));
+    }
+}
 
 // ─────────────────────────────────────────────
 //  AUTOCOMPLETE
@@ -125,7 +136,6 @@ struct ClientState {
     active_game_id: Option<u64>,
     spectating_game_id: Option<u64>,
     authenticated: bool,
-    auth_signal: Option<mpsc::Sender<bool>>,
     // UI state
     log: Vec<LogMessage>,
     current_fen: Option<String>,
@@ -150,7 +160,6 @@ impl Default for ClientState {
             active_game_id: None,
             spectating_game_id: None,
             authenticated: false,
-            auth_signal: None,
             log: Vec::new(),
             current_fen: None,
             current_game_white_uid: None,
@@ -222,30 +231,37 @@ fn main() {
                     .add_query(|q| q.from.move_record())
                     .add_query(|q| q.from.spectator())
                     .add_query(|q| q.from.chat_message())
-                    .add_query(|q| q.from.my_session())
+                    .add_query(|q| q.from.session())
                     .subscribe();
 
                 // AUTH EVENTS
-                ctx.db().my_session().on_insert({
+                ctx.db().session().on_insert({
                     let state = state_for_connect.clone();
+                    let conn_holder = conn_holder_clone.clone();
                     move |_ctx, session| {
                         let mut st = state.lock().unwrap();
                         if Some(session.identity) == st.my_identity {
+                            let conn = conn_holder.lock().unwrap();
+                            let conn = conn.as_ref().unwrap();
+                            let username = conn
+                                .db()
+                                .user()
+                                .user_id()
+                                .find(&session.user_id)
+                                .map(|u| u.username)
+                                .unwrap_or_else(|| format!("user#{}", session.user_id));
                             st.my_user_id = Some(session.user_id);
-                            st.my_username = Some(session.username.clone());
+                            st.my_username = Some(username.clone());
                             st.authenticated = true;
                             st.push(LogMessage::system(format!(
                                 "✓ Logged in as '{}'. Type 'help' for commands.",
-                                session.username
+                                username
                             )));
-                            if let Some(tx) = st.auth_signal.take() {
-                                let _ = tx.send(true);
-                            }
                         }
                     }
                 });
 
-                ctx.db().my_session().on_delete({
+                ctx.db().session().on_delete({
                     let state = state_for_connect.clone();
                     move |_ctx, session| {
                         let mut st = state.lock().unwrap();
@@ -297,7 +313,7 @@ fn main() {
                             st.current_game_white_uid = Some(g.white_user_id);
                             st.status_line = match g.status {
                                 GameStatus::InProgress => {
-                                    let (name, color) = if g.turn == Color::White {
+                                    let (name, color) = if g.turn == PieceColor::White {
                                         (&g.white_username, "White")
                                     } else {
                                         (&g.black_username, "Black")
@@ -704,8 +720,6 @@ fn draw(f: &mut ratatui::Frame, st: &ClientState) {
 }
 
 fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
-    use ratatui::style::{Color, Style};
-
     // Split into board + status line
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -779,6 +793,13 @@ fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
             let ch = squares[*rank as usize][*file as usize];
 
             let piece = piece_unicode(ch);
+            let is_black_piece = ch.is_lowercase() && ch != '.';
+
+            let fg = if is_black_piece {
+                Color::Rgb(30, 30, 30)
+            } else {
+                Color::Rgb(255, 255, 255)
+            };
 
             let bg = if (rank + file) % 2 == 0 {
                 Color::Rgb(110, 78, 55)
@@ -787,7 +808,7 @@ fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
             };
             spans.push(Span::styled(
                 format!(" {} ", piece),
-                Style::default().bg(bg),
+                Style::default().fg(fg).bg(bg),
             ));
         }
         lines.push(Line::from(spans));
@@ -826,7 +847,9 @@ fn draw_log(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
         .iter()
         .map(|msg| {
             let style = match msg.kind {
-                LogKind::Error => Style::default().add_modifier(Modifier::BOLD),
+                LogKind::Error => Style::default()
+                    .fg(ratatui::style::Color::Red)
+                    .add_modifier(Modifier::BOLD),
                 LogKind::Chat => Style::default().add_modifier(Modifier::ITALIC),
                 LogKind::System => Style::default().add_modifier(Modifier::DIM),
                 LogKind::Info => Style::default(),
@@ -925,7 +948,7 @@ fn draw_input(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
 //  REPL LOOP  (runs in its own thread)
 // ─────────────────────────────────────────────
 
-fn repl_loop(conn: &DbConnection, state: &State) {
+fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
     let (tx, rx) = mpsc::channel::<String>();
     *COMMAND_TX.lock().unwrap() = Some(tx);
 
@@ -954,22 +977,21 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                         .push(LogMessage::error("Usage: login <username>"));
                     continue;
                 }
-                let password = prompt_password(state, "Password");
-                let (tx, prx) = mpsc::channel();
-                state.lock().unwrap().auth_signal = Some(tx);
-                match conn.reducers().login(username, password) {
-                    Ok(_) => match prx.recv_timeout(Duration::from_secs(5)) {
-                        Ok(true) => {}
-                        _ => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error("✗ Invalid login")),
-                    },
-                    Err(e) => state
+                // Check if user exists in local cache before prompting for password
+                if conn.db().user().username().find(&username).is_none() {
+                    state
                         .lock()
                         .unwrap()
-                        .push(LogMessage::error(format!("Error: {e}"))),
+                        .push(LogMessage::error("Unknown username."));
+                    continue;
                 }
+                let password = prompt_password(state, "Password");
+                let state_cb = Arc::clone(&state);
+                let _ = conn
+                    .reducers()
+                    .login_then(username, password, move |_ctx, result| {
+                        reducer_callback(&state_cb, result);
+                    });
             }
 
             "register" => {
@@ -990,51 +1012,49 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                         .push(LogMessage::error("Passwords do not match"));
                     continue;
                 }
-                match conn.reducers().register(username.clone(), password.clone()) {
-                    Ok(_) => {
-                        state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::system("Registered. Logging in..."));
-                        let (tx, prx) = mpsc::channel();
-                        state.lock().unwrap().auth_signal = Some(tx);
-                        match conn.reducers().login(username, password) {
-                            Ok(_) => match prx.recv_timeout(Duration::from_secs(5)) {
-                                Ok(true) => {}
-                                _ => state
-                                    .lock()
-                                    .unwrap()
-                                    .push(LogMessage::error("Login failed")),
-                            },
-                            Err(e) => state
+                let state_cb = Arc::clone(&state);
+                let conn_cb = Arc::clone(&conn);
+                let _ = conn.reducers().register_then(
+                    username.clone(),
+                    password.clone(),
+                    move |_ctx, result| match result {
+                        Ok(Ok(())) => {
+                            state_cb
                                 .lock()
                                 .unwrap()
-                                .push(LogMessage::error(format!("Error: {e}"))),
+                                .push(LogMessage::system("Registered. Logging in..."));
+                            let state_cb2 = Arc::clone(&state_cb);
+                            let _ = conn_cb.reducers().login_then(
+                                username,
+                                password,
+                                move |_ctx, result| {
+                                    reducer_callback(&state_cb2, result);
+                                },
+                            );
                         }
-                    }
-                    Err(e) => state
-                        .lock()
-                        .unwrap()
-                        .push(LogMessage::error(format!("Error: {e}"))),
-                }
+                        Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                        Err(e) => state_cb
+                            .lock()
+                            .unwrap()
+                            .push(LogMessage::error(format!("Internal error: {e}"))),
+                    },
+                );
             }
 
-            "logout" => match conn.reducers().logout() {
-                Ok(_) => {
-                    let mut st = state.lock().unwrap();
-                    st.my_user_id = None;
-                    st.my_username = None;
-                    st.authenticated = false;
-                    st.active_game_id = None;
-                    st.spectating_game_id = None;
-                    st.current_fen = None;
-                    st.status_line = "No active game".to_string();
-                }
-                Err(e) => state
-                    .lock()
-                    .unwrap()
-                    .push(LogMessage::error(format!("Error: {e}"))),
-            },
+            "logout" => {
+                let state_cb = Arc::clone(&state);
+                let _ = conn.reducers().logout_then(move |_ctx, result| {
+                    reducer_callback(&state_cb, result);
+                });
+                let mut st = state.lock().unwrap();
+                st.my_user_id = None;
+                st.my_username = None;
+                st.authenticated = false;
+                st.active_game_id = None;
+                st.spectating_game_id = None;
+                st.current_fen = None;
+                st.status_line = "No active game".to_string();
+            }
 
             "passwd" => {
                 let current = prompt_password(state, "Current password");
@@ -1046,16 +1066,22 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                         .unwrap()
                         .push(LogMessage::error("Passwords do not match."));
                 } else {
-                    match conn.reducers().change_password(current, new_pw) {
-                        Ok(_) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::system("✓ Password changed.")),
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    }
+                    let state_cb = Arc::clone(&state);
+                    let _ = conn.reducers().change_password_then(
+                        current,
+                        new_pw,
+                        move |_ctx, result| match result {
+                            Ok(Ok(())) => state_cb
+                                .lock()
+                                .unwrap()
+                                .push(LogMessage::system("✓ Password changed.")),
+                            Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                            Err(e) => state_cb
+                                .lock()
+                                .unwrap()
+                                .push(LogMessage::error(format!("Internal error: {e}"))),
+                        },
+                    );
                 }
             }
 
@@ -1063,7 +1089,7 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                 let st = state.lock().unwrap();
                 if let (Some(uid), Some(uname)) = (st.my_user_id, st.my_username.clone()) {
                     drop(st);
-                    if let Some(user) = conn.db().user().iter().find(|u| u.user_id == uid) {
+                    if let Some(user) = conn.db().user().user_id().find(&uid) {
                         state.lock().unwrap().push(LogMessage::info(format!(
                             "{} (id={})  W:{} L:{} D:{}",
                             user.username, user.user_id, user.wins, user.losses, user.draws
@@ -1098,27 +1124,39 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                 }
             }
 
-            "join" => match conn.reducers().join_lobby() {
-                Ok(_) => state
-                    .lock()
-                    .unwrap()
-                    .push(LogMessage::system("Joined matchmaking lobby…")),
-                Err(e) => state
-                    .lock()
-                    .unwrap()
-                    .push(LogMessage::error(format!("Error: {e}"))),
-            },
+            "join" => {
+                let state_cb = Arc::clone(&state);
+                let _ = conn
+                    .reducers()
+                    .join_lobby_then(move |_ctx, result| match result {
+                        Ok(Ok(())) => state_cb
+                            .lock()
+                            .unwrap()
+                            .push(LogMessage::system("Joined matchmaking lobby…")),
+                        Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                        Err(e) => state_cb
+                            .lock()
+                            .unwrap()
+                            .push(LogMessage::error(format!("Internal error: {e}"))),
+                    });
+            }
 
-            "leave" => match conn.reducers().leave_lobby() {
-                Ok(_) => state
-                    .lock()
-                    .unwrap()
-                    .push(LogMessage::system("Left lobby.")),
-                Err(e) => state
-                    .lock()
-                    .unwrap()
-                    .push(LogMessage::error(format!("Error: {e}"))),
-            },
+            "leave" => {
+                let state_cb = Arc::clone(&state);
+                let _ = conn
+                    .reducers()
+                    .leave_lobby_then(move |_ctx, result| match result {
+                        Ok(Ok(())) => state_cb
+                            .lock()
+                            .unwrap()
+                            .push(LogMessage::system("Left lobby.")),
+                        Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                        Err(e) => state_cb
+                            .lock()
+                            .unwrap()
+                            .push(LogMessage::error(format!("Internal error: {e}"))),
+                    });
+            }
 
             // ── Games ──────────────────────────────────────────────────────
             "games" => {
@@ -1159,7 +1197,7 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                         st.push(LogMessage::system(format!("Viewing game #{}", id)));
                         st.status_line = match game.status {
                             GameStatus::InProgress => {
-                                let (name, color) = if game.turn == Color::White {
+                                let (name, color) = if game.turn == PieceColor::White {
                                     (&game.white_username, "White")
                                 } else {
                                     (&game.black_username, "Black")
@@ -1205,13 +1243,18 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                 match (parse_square(parts[1]), parse_square(parts[2])) {
                     (Ok((ff, fr)), Ok((tf, tr))) => {
                         let promo = parts.get(3).map(|s| s.to_string());
-                        match conn.reducers().make_move(game_id, ff, fr, tf, tr, promo) {
-                            Ok(_) => {}
-                            Err(e) => state
-                                .lock()
-                                .unwrap()
-                                .push(LogMessage::error(format!("Illegal move: {e}"))),
-                        }
+                        let state_cb = Arc::clone(&state);
+                        let _ = conn.reducers().make_move_then(
+                            game_id,
+                            ff,
+                            fr,
+                            tf,
+                            tr,
+                            promo,
+                            move |_ctx, result| {
+                                reducer_callback(&state_cb, result);
+                            },
+                        );
                     }
                     (Err(e), _) => state
                         .lock()
@@ -1228,16 +1271,22 @@ fn repl_loop(conn: &DbConnection, state: &State) {
             "resign" => {
                 let gid = state.lock().unwrap().active_game_id;
                 match gid {
-                    Some(id) => match conn.reducers().resign(id) {
-                        Ok(_) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::system("You resigned.")),
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    },
+                    Some(id) => {
+                        let state_cb = Arc::clone(&state);
+                        let _ = conn
+                            .reducers()
+                            .resign_then(id, move |_ctx, result| match result {
+                                Ok(Ok(())) => state_cb
+                                    .lock()
+                                    .unwrap()
+                                    .push(LogMessage::system("You resigned.")),
+                                Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                                Err(e) => state_cb
+                                    .lock()
+                                    .unwrap()
+                                    .push(LogMessage::error(format!("Internal error: {e}"))),
+                            });
+                    }
                     None => state
                         .lock()
                         .unwrap()
@@ -1248,16 +1297,24 @@ fn repl_loop(conn: &DbConnection, state: &State) {
             "draw" => {
                 let gid = state.lock().unwrap().active_game_id;
                 match gid {
-                    Some(id) => match conn.reducers().offer_draw(id) {
-                        Ok(_) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::system("Draw offer sent (or accepted).")),
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    },
+                    Some(id) => {
+                        let state_cb = Arc::clone(&state);
+                        let _ =
+                            conn.reducers()
+                                .offer_draw_then(id, move |_ctx, result| match result {
+                                    Ok(Ok(())) => state_cb
+                                        .lock()
+                                        .unwrap()
+                                        .push(LogMessage::system("Draw offer sent (or accepted).")),
+                                    Ok(Err(e)) => {
+                                        state_cb.lock().unwrap().push(LogMessage::error(e))
+                                    }
+                                    Err(e) => state_cb
+                                        .lock()
+                                        .unwrap()
+                                        .push(LogMessage::error(format!("Internal error: {e}"))),
+                                });
+                    }
                     None => state
                         .lock()
                         .unwrap()
@@ -1287,7 +1344,7 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                             )));
                             for m in &moves {
                                 let num = (m.ply + 1) / 2;
-                                let side = if m.piece_color == Color::White {
+                                let side = if m.piece_color == PieceColor::White {
                                     "W"
                                 } else {
                                     "B"
@@ -1384,17 +1441,24 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                         .unwrap()
                         .push(LogMessage::error("Usage: spectate <game_id>"));
                 } else if let Ok(id) = parts[1].parse::<u64>() {
-                    match conn.reducers().spectate_game(id) {
-                        Ok(_) => {
-                            let mut st = state.lock().unwrap();
-                            st.spectating_game_id = Some(id);
-                            st.push(LogMessage::system(format!("Now spectating game #{}", id)));
-                        }
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    }
+                    let state_cb = Arc::clone(&state);
+                    let _ =
+                        conn.reducers()
+                            .spectate_game_then(id, move |_ctx, result| match result {
+                                Ok(Ok(())) => {
+                                    let mut st = state_cb.lock().unwrap();
+                                    st.spectating_game_id = Some(id);
+                                    st.push(LogMessage::system(format!(
+                                        "Now spectating game #{}",
+                                        id
+                                    )));
+                                }
+                                Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                                Err(e) => state_cb
+                                    .lock()
+                                    .unwrap()
+                                    .push(LogMessage::error(format!("Internal error: {e}"))),
+                            });
                 } else {
                     state
                         .lock()
@@ -1406,17 +1470,23 @@ fn repl_loop(conn: &DbConnection, state: &State) {
             "unspectate" => {
                 let gid = state.lock().unwrap().spectating_game_id;
                 match gid {
-                    Some(id) => match conn.reducers().leave_spectate(id) {
-                        Ok(_) => {
-                            let mut st = state.lock().unwrap();
-                            st.spectating_game_id = None;
-                            st.push(LogMessage::system("Stopped spectating."));
-                        }
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    },
+                    Some(id) => {
+                        let state_cb = Arc::clone(&state);
+                        let _ = conn
+                            .reducers()
+                            .leave_spectate_then(id, move |_ctx, result| match result {
+                                Ok(Ok(())) => {
+                                    let mut st = state_cb.lock().unwrap();
+                                    st.spectating_game_id = None;
+                                    st.push(LogMessage::system("Stopped spectating."));
+                                }
+                                Ok(Err(e)) => state_cb.lock().unwrap().push(LogMessage::error(e)),
+                                Err(e) => state_cb
+                                    .lock()
+                                    .unwrap()
+                                    .push(LogMessage::error(format!("Internal error: {e}"))),
+                            });
+                    }
                     None => state
                         .lock()
                         .unwrap()
@@ -1463,13 +1533,12 @@ fn repl_loop(conn: &DbConnection, state: &State) {
                 } else {
                     let text = parts[1..].join(" ");
                     let gid = state.lock().unwrap().active_game_id.unwrap_or(0);
-                    match conn.reducers().send_chat(gid, text) {
-                        Ok(_) => {}
-                        Err(e) => state
-                            .lock()
-                            .unwrap()
-                            .push(LogMessage::error(format!("Error: {e}"))),
-                    }
+                    let state_cb = Arc::clone(&state);
+                    let _ = conn
+                        .reducers()
+                        .send_chat_then(gid, text, move |_ctx, result| {
+                            reducer_callback(&state_cb, result);
+                        });
                 }
             }
 
@@ -1501,7 +1570,6 @@ fn repl_loop(conn: &DbConnection, state: &State) {
         }
     }
 }
-
 // ─────────────────────────────────────────────
 //  PASSWORD PROMPT  (via log + channel)
 // ─────────────────────────────────────────────

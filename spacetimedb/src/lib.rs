@@ -9,7 +9,7 @@ use spacetimedb::{rand::RngCore, ReducerContext, SpacetimeType, Table, Timestamp
 // ─────────────────────────────────────────────
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Copy)]
-pub enum Color {
+pub enum PieceColor {
     White,
     Black,
 }
@@ -27,7 +27,7 @@ pub enum PieceKind {
 #[derive(SpacetimeType, Clone, Debug, PartialEq)]
 pub struct Piece {
     pub kind: PieceKind,
-    pub color: Color,
+    pub color: PieceColor,
 }
 
 #[derive(SpacetimeType, Clone, Debug, PartialEq, Copy)]
@@ -67,20 +67,8 @@ pub struct User {
     pub last_login: Timestamp,
 }
 
-#[spacetimedb::table(accessor = my_session, public)]
-pub struct MySession {
-    #[primary_key]
-    pub identity: spacetimedb::Identity,
-
-    pub user_id: u64,
-    pub username: String,
-    pub logged_in_at: Timestamp,
-}
-
 /// Active session — maps a SpacetimeDB Identity (connection) to a User account.
-/// Deleted on logout or client disconnect.
-/// NOT public: only the server reads this.
-#[spacetimedb::table(accessor = session)]
+#[spacetimedb::table(accessor = session, public)]
 pub struct Session {
     #[primary_key]
     pub identity: spacetimedb::Identity,
@@ -117,7 +105,7 @@ pub struct Game {
     /// Full FEN string — encodes complete board state.
     pub fen: String,
     pub status: GameStatus,
-    pub turn: Color,
+    pub turn: PieceColor,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub winner_user_id: Option<u64>,
@@ -144,7 +132,7 @@ pub struct MoveRecord {
     /// Algebraic notation, e.g. "e4", "Nf3", "O-O".
     pub san: String,
     pub piece_kind: PieceKind,
-    pub piece_color: Color,
+    pub piece_color: PieceColor,
     pub captured: Option<PieceKind>,
     pub promotion: Option<PieceKind>,
     pub is_check: bool,
@@ -254,7 +242,7 @@ const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -
 
 struct Board {
     squares: [[Option<Piece>; 8]; 8],
-    active: Color,
+    active: PieceColor,
     castling: String,
     ep_file: Option<u8>,
     ep_rank: Option<u8>,
@@ -277,9 +265,9 @@ impl Board {
                     file += n as usize;
                 } else {
                     let color = if ch.is_uppercase() {
-                        Color::White
+                        PieceColor::White
                     } else {
-                        Color::Black
+                        PieceColor::Black
                     };
                     let kind = match ch.to_ascii_lowercase() {
                         'k' => PieceKind::King,
@@ -296,8 +284,8 @@ impl Board {
             }
         }
         let active = match p[1] {
-            "w" => Color::White,
-            "b" => Color::Black,
+            "w" => PieceColor::White,
+            "b" => PieceColor::Black,
             _ => return Err("Invalid active color".to_string()),
         };
         let (ep_file, ep_rank) = if p[3] == "-" {
@@ -353,7 +341,7 @@ impl Board {
                             PieceKind::Knight => 'n',
                             PieceKind::Pawn => 'p',
                         };
-                        row.push(if p.color == Color::White {
+                        row.push(if p.color == PieceColor::White {
                             c.to_ascii_uppercase()
                         } else {
                             c
@@ -374,8 +362,8 @@ impl Board {
             "{} {} {} {} {} {}",
             rows.join("/"),
             match self.active {
-                Color::White => "w",
-                Color::Black => "b",
+                PieceColor::White => "w",
+                PieceColor::Black => "b",
             },
             if self.castling.is_empty() {
                 "-"
@@ -419,7 +407,11 @@ impl Board {
 
         match piece.kind {
             PieceKind::Pawn => {
-                let dir: i8 = if piece.color == Color::White { 1 } else { -1 };
+                let dir: i8 = if piece.color == PieceColor::White {
+                    1
+                } else {
+                    -1
+                };
                 let df = tf as i8 - ff as i8;
                 let dr = tr as i8 - fr as i8;
                 if df == 0 && dr == dir {
@@ -427,7 +419,7 @@ impl Board {
                         return Err("Pawn blocked".to_string());
                     }
                 } else if df == 0 && dr == 2 * dir {
-                    let start = if piece.color == Color::White {
+                    let start = if piece.color == PieceColor::White {
                         1u8
                     } else {
                         6u8
@@ -453,7 +445,7 @@ impl Board {
                         ff, fr, tf, tr
                     ));
                 }
-                let back = if piece.color == Color::White {
+                let back = if piece.color == PieceColor::White {
                     7u8
                 } else {
                     0u8
@@ -505,7 +497,7 @@ impl Board {
 
         if is_ep {
             let cap_rank = (tr as i8
-                - if piece.color == Color::White {
+                - if piece.color == PieceColor::White {
                     1i8
                 } else {
                     -1i8
@@ -531,7 +523,7 @@ impl Board {
 
         if piece.kind == PieceKind::Pawn && (tr as i8 - fr as i8).abs() == 2 {
             let ep_r = (fr as i8
-                + if piece.color == Color::White {
+                + if piece.color == PieceColor::White {
                     1i8
                 } else {
                     -1i8
@@ -549,12 +541,12 @@ impl Board {
         } else {
             self.halfmove += 1;
         }
-        if self.active == Color::Black {
+        if self.active == PieceColor::Black {
             self.fullmove += 1;
         }
         self.active = match self.active {
-            Color::White => Color::Black,
-            Color::Black => Color::White,
+            PieceColor::White => PieceColor::Black,
+            PieceColor::Black => PieceColor::White,
         };
         Ok((captured_kind, is_ep, is_castle))
     }
@@ -577,10 +569,10 @@ impl Board {
     fn validate_castle(&self, ff: u8, fr: u8, tf: u8, piece: &Piece) -> Result<(), String> {
         let kingside = tf > ff;
         let right = match (piece.color, kingside) {
-            (Color::White, true) => 'K',
-            (Color::White, false) => 'Q',
-            (Color::Black, true) => 'k',
-            (Color::Black, false) => 'q',
+            (PieceColor::White, true) => 'K',
+            (PieceColor::White, false) => 'Q',
+            (PieceColor::Black, true) => 'k',
+            (PieceColor::Black, false) => 'q',
         };
         if !self.castling.contains(right) {
             return Err("Castling not available".to_string());
@@ -600,13 +592,13 @@ impl Board {
 
     fn update_castling_rights(&mut self, ff: u8, fr: u8, tf: u8, tr: u8, piece: &Piece) {
         match (piece.kind, piece.color) {
-            (PieceKind::King, Color::White) => {
+            (PieceKind::King, PieceColor::White) => {
                 self.castling.retain(|c| c != 'K' && c != 'Q');
             }
-            (PieceKind::King, Color::Black) => {
+            (PieceKind::King, PieceColor::Black) => {
                 self.castling.retain(|c| c != 'k' && c != 'q');
             }
-            (PieceKind::Rook, Color::White) => {
+            (PieceKind::Rook, PieceColor::White) => {
                 if ff == 7 && fr == 0 {
                     self.castling.retain(|c| c != 'K');
                 }
@@ -614,7 +606,7 @@ impl Board {
                     self.castling.retain(|c| c != 'Q');
                 }
             }
-            (PieceKind::Rook, Color::Black) => {
+            (PieceKind::Rook, PieceColor::Black) => {
                 if ff == 7 && fr == 7 {
                     self.castling.retain(|c| c != 'k');
                 }
@@ -638,7 +630,7 @@ impl Board {
         }
     }
 
-    fn king_in_check(&self, color: Color) -> bool {
+    fn king_in_check(&self, color: PieceColor) -> bool {
         let mut kf = 0u8;
         let mut kr = 0u8;
         'outer: for rank in 0..8u8 {
@@ -653,8 +645,8 @@ impl Board {
             }
         }
         let opp = match color {
-            Color::White => Color::Black,
-            Color::Black => Color::White,
+            PieceColor::White => PieceColor::Black,
+            PieceColor::Black => PieceColor::White,
         };
         for (df, dr) in &[
             (1i8, 2i8),
@@ -705,7 +697,7 @@ impl Board {
                 r += dr;
             }
         }
-        let pd: i8 = if color == Color::White { 1 } else { -1 };
+        let pd: i8 = if color == PieceColor::White { 1 } else { -1 };
         for df in &[-1i8, 1] {
             let f = kf as i8 + df;
             let r = kr as i8 + pd;
@@ -885,26 +877,12 @@ pub fn login(ctx: &ReducerContext, username: String, password: String) -> Result
 
     verify_password(&password, &user.password_hash)?;
 
-    // --- PRIVATE SESSION ---
     if ctx.db.session().identity().find(ctx.sender()).is_some() {
         ctx.db.session().identity().delete(&ctx.sender());
     }
-
     ctx.db.session().insert(Session {
         identity: ctx.sender(),
         user_id: user.user_id,
-        logged_in_at: ctx.timestamp,
-    });
-
-    // --- PUBLIC VIEW (IMPORTANT PART) ---
-    if ctx.db.my_session().identity().find(ctx.sender()).is_some() {
-        ctx.db.my_session().identity().delete(&ctx.sender());
-    }
-
-    ctx.db.my_session().insert(MySession {
-        identity: ctx.sender(),
-        user_id: user.user_id,
-        username: user.username.clone(),
         logged_in_at: ctx.timestamp,
     });
 
@@ -929,7 +907,6 @@ pub fn logout(ctx: &ReducerContext) -> Result<(), String> {
         .ok_or("Not logged in")?;
 
     ctx.db.session().identity().delete(&ctx.sender());
-    ctx.db.my_session().identity().delete(&ctx.sender());
     Ok(())
 }
 
@@ -1011,7 +988,7 @@ pub fn join_lobby(ctx: &ReducerContext) -> Result<(), String> {
             black_username,
             fen: STARTING_FEN.to_string(),
             status: GameStatus::InProgress,
-            turn: Color::White,
+            turn: PieceColor::White,
             created_at: ctx.timestamp,
             updated_at: ctx.timestamp,
             winner_user_id: None,
@@ -1066,9 +1043,9 @@ pub fn make_move(
         return Err("Game is not in progress".to_string());
     }
     let player_color = if user.user_id == game.white_user_id {
-        Color::White
+        PieceColor::White
     } else if user.user_id == game.black_user_id {
-        Color::Black
+        PieceColor::Black
     } else {
         return Err("You are not a player in this game".to_string());
     };
@@ -1098,8 +1075,8 @@ pub fn make_move(
     }
 
     let opp = match player_color {
-        Color::White => Color::Black,
-        Color::Black => Color::White,
+        PieceColor::White => PieceColor::Black,
+        PieceColor::Black => PieceColor::White,
     };
     let is_check = board.king_in_check(opp);
     let is_checkmate = false; // Full legal-move gen needed — extension point
@@ -1145,8 +1122,8 @@ pub fn make_move(
     });
 
     let new_turn = match game.turn {
-        Color::White => Color::Black,
-        Color::Black => Color::White,
+        PieceColor::White => PieceColor::Black,
+        PieceColor::Black => PieceColor::White,
     };
     ctx.db.game().id().update(Game {
         fen: board.to_fen(),
@@ -1290,7 +1267,7 @@ pub fn send_chat(ctx: &ReducerContext, game_id: u64, text: String) -> Result<(),
     if text.trim().is_empty() {
         return Err("Message cannot be empty".to_string());
     }
-    if text.len() > 500 {
+    if text.len() > 20 {
         return Err("Message too long".to_string());
     }
     ctx.db.chat_message().insert(ChatMessage {
