@@ -43,6 +43,7 @@ fn reducer_callback(state: &State, result: Result<Result<(), String>, impl std::
 
 const COMMANDS: &[&str] = &[
     "help",
+    "clear",
     "whoami",
     "passwd",
     "logout",
@@ -131,8 +132,8 @@ impl LogMessage {
 
 struct ClientState {
     my_identity: Option<Identity>,
-    my_user_id: Option<u64>,
-    my_username: Option<String>,
+    my_player_id: Option<u64>,
+    my_name: Option<String>,
     active_game_id: Option<u64>,
     spectating_game_id: Option<u64>,
     authenticated: bool,
@@ -155,8 +156,8 @@ impl Default for ClientState {
     fn default() -> Self {
         Self {
             my_identity: None,
-            my_user_id: None,
-            my_username: None,
+            my_player_id: None,
+            my_name: None,
             active_game_id: None,
             spectating_game_id: None,
             authenticated: false,
@@ -219,13 +220,13 @@ fn main() {
                     st.authenticated = false;
                     st.push(LogMessage::system("✓ Connected to SpacetimeDB"));
                     st.push(LogMessage::system(
-                        "Use 'login <user>' or 'register <user>'",
+                        "Use 'login <name>' or 'register <name>'",
                     ));
                 }
 
                 ctx.subscription_builder()
                     .on_error(|_ctx, e| eprintln!("[subscription error] {e}"))
-                    .add_query(|q| q.from.user())
+                    .add_query(|q| q.from.player())
                     .add_query(|q| q.from.game())
                     .add_query(|q| q.from.lobby_entry())
                     .add_query(|q| q.from.move_record())
@@ -243,19 +244,19 @@ fn main() {
                         if Some(session.identity) == st.my_identity {
                             let conn = conn_holder.lock().unwrap();
                             let conn = conn.as_ref().unwrap();
-                            let username = conn
+                            let playername = conn
                                 .db()
-                                .user()
-                                .user_id()
+                                .player()
+                                .id()
                                 .find(&session.user_id)
-                                .map(|u| u.username)
-                                .unwrap_or_else(|| format!("user#{}", session.user_id));
-                            st.my_user_id = Some(session.user_id);
-                            st.my_username = Some(username.clone());
+                                .map(|p| p.name)
+                                .unwrap_or_else(|| format!("player#{}", session.user_id));
+                            st.my_player_id = Some(session.user_id);
+                            st.my_name = Some(playername.clone());
                             st.authenticated = true;
                             st.push(LogMessage::system(format!(
                                 "✓ Logged in as '{}'. Type 'help' for commands.",
-                                username
+                                playername
                             )));
                         }
                     }
@@ -266,8 +267,8 @@ fn main() {
                     move |_ctx, session| {
                         let mut st = state.lock().unwrap();
                         if Some(session.identity) == st.my_identity {
-                            st.my_user_id = None;
-                            st.my_username = None;
+                            st.my_player_id = None;
+                            st.my_name = None;
                             st.authenticated = false;
                             st.push(LogMessage::system("Logged out."));
                         }
@@ -279,19 +280,22 @@ fn main() {
                     let state = state_for_connect.clone();
                     move |_ctx, game| {
                         let mut st = state.lock().unwrap();
-                        if let Some(uid) = st.my_user_id {
-                            if game.white_user_id == uid || game.black_user_id == uid {
-                                let my_color = if game.white_user_id == uid {
+                        if let Some(uid) = st.my_player_id {
+                            if game.white_player_id == uid || game.black_player_id == uid {
+                                let my_color = if game.white_player_id == uid {
                                     "White ♔"
                                 } else {
                                     "Black ♚"
                                 };
                                 st.active_game_id = Some(game.id);
                                 st.current_fen = Some(game.fen.clone());
-                                st.current_game_white_uid = Some(game.white_user_id);
+                                st.current_game_white_uid = Some(game.white_player_id);
                                 st.status_line = format!(
                                     "🎮 Game #{} started! You are {}  ({} vs {})",
-                                    game.id, my_color, game.white_username, game.black_username
+                                    game.id,
+                                    my_color,
+                                    game.white_player_name,
+                                    game.black_player_name
                                 );
                             }
                         }
@@ -302,21 +306,21 @@ fn main() {
                     let state = state_for_connect.clone();
                     move |_ctx, _old, g| {
                         let mut st = state.lock().unwrap();
-                        let uid = st.my_user_id;
+                        let uid = st.my_player_id;
                         let watching =
                             st.active_game_id == Some(g.id) || st.spectating_game_id == Some(g.id);
                         let is_player =
-                            uid.map_or(false, |u| u == g.white_user_id || u == g.black_user_id);
+                            uid.map_or(false, |u| u == g.white_player_id || u == g.black_player_id);
 
                         if watching || is_player {
                             st.current_fen = Some(g.fen.clone());
-                            st.current_game_white_uid = Some(g.white_user_id);
+                            st.current_game_white_uid = Some(g.white_player_id);
                             st.status_line = match g.status {
                                 GameStatus::InProgress => {
                                     let (name, color) = if g.turn == PieceColor::White {
-                                        (&g.white_username, "White")
+                                        (&g.white_player_name, "White")
                                     } else {
-                                        (&g.black_username, "Black")
+                                        (&g.black_player_name, "Black")
                                     };
                                     format!("Turn: {} ({})", name, color)
                                 }
@@ -334,7 +338,7 @@ fn main() {
                     let state = state_for_connect.clone();
                     move |_ctx, msg| {
                         let mut st = state.lock().unwrap();
-                        if st.my_user_id.is_none() {
+                        if st.my_player_id.is_none() {
                             return;
                         }
                         let relevant = msg.game_id == 0
@@ -348,7 +352,7 @@ fn main() {
                             };
                             st.push(LogMessage::chat(format!(
                                 "[{}] {}: {}",
-                                label, msg.sender_name, msg.text
+                                label, msg.player_name, msg.text
                             )));
                         }
                     }
@@ -720,7 +724,6 @@ fn draw(f: &mut ratatui::Frame, st: &ClientState) {
 }
 
 fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
-    // Split into board + status line
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
@@ -729,33 +732,24 @@ fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
     let board_area = layout[0];
     let status_area = layout[1];
 
-    // BOARD BLOCK
     let block = Block::default().title(" Board ").borders(Borders::ALL);
-
     let inner = block.inner(board_area);
-
     f.render_widget(block, board_area);
 
-    // STATUS BLOCK
     let status = Paragraph::new(st.status_line.clone())
         .block(Block::default().title(" Status ").borders(Borders::ALL));
-
     f.render_widget(status, status_area);
 
-    // NO GAME
     let Some(ref fen) = st.current_fen else {
         let placeholder = Paragraph::new("No active game.\n\nUse 'games'\nthen\n'game <id>'.")
             .wrap(Wrap { trim: false });
-
         f.render_widget(placeholder, inner);
         return;
     };
 
-    // NORMAL BOARD RENDERING
     let white_uid = st.current_game_white_uid;
-
     let white_view = st
-        .my_user_id
+        .my_player_id
         .and_then(|uid| white_uid.map(|w| uid == w))
         .unwrap_or(true);
 
@@ -765,7 +759,6 @@ fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
     for (ri, row) in board_part.split('/').enumerate() {
         let rank = 7 - ri;
         let mut file = 0usize;
-
         for ch in row.chars() {
             if let Some(n) = ch.to_digit(10) {
                 file += n as usize;
@@ -786,48 +779,62 @@ fn draw_board(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
     } else {
         (0..8).rev().collect()
     };
+
+    let row_height = 2;
     let mut lines: Vec<Line> = Vec::new();
+
     for rank in &ranks {
-        let mut spans = vec![Span::raw(format!(" {} ", rank + 1))];
-        for file in &files {
-            let ch = squares[*rank as usize][*file as usize];
-
-            let piece = piece_unicode(ch);
-            let is_black_piece = ch.is_lowercase() && ch != '.';
-
-            let fg = if is_black_piece {
-                Color::Rgb(30, 30, 30)
+        for row in 0..row_height {
+            let rank_label = if row == row_height / 2 {
+                format!(" {} ", rank + 1)
             } else {
-                Color::Rgb(255, 255, 255)
+                "   ".to_string()
             };
+            let mut spans = vec![Span::raw(rank_label)];
 
-            let bg = if (rank + file) % 2 == 0 {
-                Color::Rgb(110, 78, 55)
-            } else {
-                Color::Rgb(181, 136, 99)
-            };
-            spans.push(Span::styled(
-                format!(" {} ", piece),
-                Style::default().fg(fg).bg(bg),
-            ));
+            for file in &files {
+                let ch = squares[*rank as usize][*file as usize];
+                let is_black_piece = ch.is_lowercase() && ch != '.';
+
+                let bg = if (rank + file) % 2 == 0 {
+                    Color::Rgb(110, 78, 55)
+                } else {
+                    Color::Rgb(181, 136, 99)
+                };
+                let fg = if is_black_piece {
+                    Color::Rgb(30, 30, 30)
+                } else {
+                    Color::Rgb(255, 255, 255)
+                };
+
+                let piece = if row == row_height / 2 && ch != '.' {
+                    piece_unicode(ch)
+                } else {
+                    " "
+                };
+
+                spans.push(Span::styled(
+                    format!("  {}  ", piece),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(""));
     let file_labels = if white_view {
-        "    a  b  c  d  e  f  g  h"
+        "     a    b    c    d    e    f    g    h"
     } else {
-        "    h  g  f  e  d  c  b  a"
+        "     h    g    f    e    d    c    b    a"
     };
     lines.push(Line::from(file_labels));
 
-    let board_widget = Paragraph::new(lines);
-    f.render_widget(board_widget, inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_log(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
-    let title = if let Some(name) = &st.my_username {
+    let title = if let Some(name) = &st.my_name {
         format!(" Log — {} ", name)
     } else {
         " Log ".to_string()
@@ -872,7 +879,7 @@ fn draw_input(f: &mut ratatui::Frame, st: &ClientState, area: Rect) {
     let prompt = if st.password_mode {
         format!("{}: ", st.password_prompt)
     } else if st.authenticated {
-        format!("{}> ", st.my_username.as_deref().unwrap_or(""))
+        format!("{}> ", st.my_name.as_deref().unwrap_or(""))
     } else {
         "auth> ".to_string()
     };
@@ -966,6 +973,9 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                     st.push(LogMessage::system(*line));
                 }
             }
+            "clear" => {
+                state.lock().unwrap().log.clear();
+            }
 
             // ── Account ───────────────────────────────────────────────────
             "login" => {
@@ -975,14 +985,6 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                         .lock()
                         .unwrap()
                         .push(LogMessage::error("Usage: login <username>"));
-                    continue;
-                }
-                // Check if user exists in local cache before prompting for password
-                if conn.db().user().username().find(&username).is_none() {
-                    state
-                        .lock()
-                        .unwrap()
-                        .push(LogMessage::error("Unknown username."));
                     continue;
                 }
                 let password = prompt_password(state, "Password");
@@ -1047,8 +1049,8 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                     reducer_callback(&state_cb, result);
                 });
                 let mut st = state.lock().unwrap();
-                st.my_user_id = None;
-                st.my_username = None;
+                st.my_player_id = None;
+                st.my_name = None;
                 st.authenticated = false;
                 st.active_game_id = None;
                 st.spectating_game_id = None;
@@ -1087,12 +1089,12 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
 
             "whoami" => {
                 let st = state.lock().unwrap();
-                if let (Some(uid), Some(uname)) = (st.my_user_id, st.my_username.clone()) {
+                if let (Some(uid), Some(uname)) = (st.my_player_id, st.my_name.clone()) {
                     drop(st);
-                    if let Some(user) = conn.db().user().user_id().find(&uid) {
+                    if let Some(player) = conn.db().player().id().find(&uid) {
                         state.lock().unwrap().push(LogMessage::info(format!(
                             "{} (id={})  W:{} L:{} D:{}",
-                            user.username, user.user_id, user.wins, user.losses, user.draws
+                            player.name, player.id, player.wins, player.losses, player.draws
                         )));
                     } else {
                         state
@@ -1119,7 +1121,7 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                 for e in &entries {
                     st.push(LogMessage::info(format!(
                         "  [{}] {} — waiting",
-                        e.id, e.username
+                        e.id, e.player_name
                     )));
                 }
             }
@@ -1177,7 +1179,7 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                 for g in &games {
                     st.push(LogMessage::info(format!(
                         "  #{} — {} (W) vs {} (B)  [turn: {:?}]",
-                        g.id, g.white_username, g.black_username, g.turn
+                        g.id, g.white_player_name, g.black_player_name, g.turn
                     )));
                 }
             }
@@ -1193,14 +1195,14 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                         let mut st = state.lock().unwrap();
                         st.active_game_id = Some(id);
                         st.current_fen = Some(game.fen.clone());
-                        st.current_game_white_uid = Some(game.white_user_id);
+                        st.current_game_white_uid = Some(game.white_player_id);
                         st.push(LogMessage::system(format!("Viewing game #{}", id)));
                         st.status_line = match game.status {
                             GameStatus::InProgress => {
                                 let (name, color) = if game.turn == PieceColor::White {
-                                    (&game.white_username, "White")
+                                    (&game.white_player_name, "White")
                                 } else {
-                                    (&game.black_username, "Black")
+                                    (&game.black_player_name, "Black")
                                 };
                                 format!("Turn: {} ({})", name, color)
                             }
@@ -1384,8 +1386,8 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                             Some(game) => {
                                 let result_str = match game.status {
                                     GameStatus::Checkmate | GameStatus::Resigned => {
-                                        match game.winner_user_id {
-                                            Some(w) if w == game.white_user_id => "1-0",
+                                        match game.winner_player_id {
+                                            Some(w) if w == game.white_player_id => "1-0",
                                             Some(_) => "0-1",
                                             None => "*",
                                         }
@@ -1397,11 +1399,11 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                                 st.push(LogMessage::system(format!("── PGN — Game #{} ──", id)));
                                 st.push(LogMessage::info(format!(
                                     "[White \"{}\"]",
-                                    game.white_username
+                                    game.white_player_name
                                 )));
                                 st.push(LogMessage::info(format!(
                                     "[Black \"{}\"]",
-                                    game.black_username
+                                    game.black_player_name
                                 )));
                                 st.push(LogMessage::info(format!("[Result \"{}\"]", result_str)));
                                 drop(st);
@@ -1513,7 +1515,7 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                             st.push(LogMessage::info("  (none)"));
                         }
                         for s in &specs {
-                            st.push(LogMessage::info(format!("  {}", s.username)));
+                            st.push(LogMessage::info(format!("  {}", s.player_name)));
                         }
                     }
                     None => state
@@ -1544,8 +1546,8 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
 
             // ── Leaderboard ────────────────────────────────────────────────
             "leaderboard" => {
-                let mut users: Vec<User> = conn.db().user().iter().collect();
-                users.sort_by(|a, b| b.wins.cmp(&a.wins));
+                let mut players: Vec<Player> = conn.db().player().iter().collect();
+                players.sort_by(|a, b| b.wins.cmp(&a.wins));
                 let mut st = state.lock().unwrap();
                 st.push(LogMessage::system("── Leaderboard ──"));
                 st.push(LogMessage::info(format!(
@@ -1553,14 +1555,13 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
                     "Player", "W", "L", "D"
                 )));
                 st.push(LogMessage::info(format!("  {}", "─".repeat(38))));
-                for u in &users {
+                for p in &players {
                     st.push(LogMessage::info(format!(
                         "  {:<20} {:>5} {:>5} {:>5}",
-                        u.username, u.wins, u.losses, u.draws
+                        p.name, p.wins, p.losses, p.draws
                     )));
                 }
             }
-
             other => {
                 state.lock().unwrap().push(LogMessage::error(format!(
                     "Unknown command '{}'. Type 'help'.",
@@ -1576,8 +1577,6 @@ fn repl_loop(conn: &Arc<DbConnection>, state: &State) {
 
 static PASSWORD_TX: std::sync::LazyLock<Mutex<Option<mpsc::Sender<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
-// static PASSWORD_RX: std::sync::LazyLock<Mutex<Option<mpsc::Receiver<String>>>> =
-//     std::sync::LazyLock::new(|| Mutex::new(None));
 
 fn prompt_password(state: &State, prompt: &str) -> String {
     let (tx, rx) = mpsc::channel();
@@ -1601,10 +1600,11 @@ fn prompt_password(state: &State, prompt: &str) -> String {
 
 const HELP_LINES: &[&str] = &[
     "── Commands ──────────────────────────────",
-    " login <user>         Log in",
-    " register <user>      Register",
+    " login <username>         Log in",
+    " register <username>      Register",
     " logout               Log out",
     " whoami               Show account",
+    " clear                Clear the log",
     " passwd               Change password",
     "──────────────────────────────────────────",
     " lobby                Show waiting players",
@@ -1628,6 +1628,7 @@ const HELP_LINES: &[&str] = &[
     " leaderboard          Player rankings",
     " quit                 Exit",
     "  Tab: autocomplete   PgUp/PgDn: scroll",
+    "──────────────────────────────────────────",
 ];
 
 // ─────────────────────────────────────────────

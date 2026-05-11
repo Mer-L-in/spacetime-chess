@@ -52,19 +52,26 @@ pub enum LobbyStatus {
 // ─────────────────────────────────────────────
 
 /// Persistent user account — survives reconnects and is identity-independent.
-#[spacetimedb::table(accessor = user, public)]
+#[spacetimedb::table(accessor = user)]
 pub struct User {
     #[primary_key]
     #[auto_inc]
-    pub user_id: u64,
+    id: u64,
     #[unique]
-    pub username: String,
-    pub password_hash: String,
-    pub wins: u32,
-    pub losses: u32,
-    pub draws: u32,
-    pub created_at: Timestamp,
-    pub last_login: Timestamp,
+    username: String,
+    password_hash: String,
+    created_at: Timestamp,
+    last_login: Timestamp,
+}
+#[spacetimedb::table(accessor = player, public)]
+pub struct Player {
+    #[primary_key]
+    id: u64,
+    #[unique]
+    name: String,
+    wins: u32,
+    losses: u32,
+    draws: u32,
 }
 
 /// Active session — maps a SpacetimeDB Identity (connection) to a User account.
@@ -86,8 +93,8 @@ pub struct LobbyEntry {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    pub user_id: u64,
-    pub username: String,
+    pub player_id: u64,
+    pub player_name: String,
     pub status: LobbyStatus,
     pub joined_at: Timestamp,
 }
@@ -98,17 +105,17 @@ pub struct Game {
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    pub white_user_id: u64,
-    pub black_user_id: u64,
-    pub white_username: String,
-    pub black_username: String,
+    pub white_player_id: u64,
+    pub black_player_id: u64,
+    pub white_player_name: String,
+    pub black_player_name: String,
     /// Full FEN string — encodes complete board state.
     pub fen: String,
     pub status: GameStatus,
     pub turn: PieceColor,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    pub winner_user_id: Option<u64>,
+    pub winner_player_id: Option<u64>,
 }
 
 /// Every half-move ever played (append-only). Used for history and PGN export.
@@ -124,7 +131,7 @@ pub struct MoveRecord {
     pub game_id: u64,
     /// 1-based half-move count (ply).
     pub ply: u32,
-    pub user_id: u64,
+    pub player_id: u64,
     pub from_file: u8,
     pub from_rank: u8,
     pub to_file: u8,
@@ -151,8 +158,8 @@ pub struct Spectator {
     #[auto_inc]
     pub id: u64,
     pub game_id: u64,
-    pub user_id: u64,
-    pub username: String,
+    pub player_id: u64,
+    pub player_name: String,
     pub joined_at: Timestamp,
 }
 
@@ -168,8 +175,8 @@ pub struct ChatMessage {
     pub id: u64,
     /// game_id = 0 means lobby chat.
     pub game_id: u64,
-    pub user_id: u64,
-    pub sender_name: String,
+    pub player_id: u64,
+    pub player_name: String,
     pub text: String,
     pub sent_at: Timestamp,
 }
@@ -181,7 +188,7 @@ pub struct DrawOffer {
     #[auto_inc]
     pub id: u64,
     pub game_id: u64,
-    pub offered_by_user_id: u64,
+    pub offered_by_player_id: u64,
     pub offered_at: Timestamp,
 }
 
@@ -229,7 +236,7 @@ fn require_auth(ctx: &ReducerContext) -> Result<User, String> {
     )?;
     ctx.db
         .user()
-        .user_id()
+        .id()
         .find(&session.user_id)
         .ok_or("Session refers to a deleted user — please log in again".to_string())
 }
@@ -240,6 +247,7 @@ fn require_auth(ctx: &ReducerContext) -> Result<User, String> {
 
 const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
+#[derive(Clone)]
 struct Board {
     squares: [[Option<Piece>; 8]; 8],
     active: PieceColor,
@@ -728,6 +736,52 @@ impl Board {
         false
     }
 
+    fn has_legal_moves(&self, color: PieceColor) -> bool {
+        for rank in 0..8u8 {
+            for file in 0..8u8 {
+                let Some(piece) = self.get(file, rank) else {
+                    continue;
+                };
+                if piece.color != color {
+                    continue;
+                }
+                for to_rank in 0..8u8 {
+                    for to_file in 0..8u8 {
+                        if to_file == file && to_rank == rank {
+                            continue;
+                        }
+                        let promotion = if piece.kind == PieceKind::Pawn {
+                            let back = if color == PieceColor::White { 7u8 } else { 0u8 };
+                            if to_rank == back {
+                                Some(PieceKind::Queen)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let mut b = self.clone();
+                        if b.apply_move(file, rank, to_file, to_rank, promotion)
+                            .is_ok()
+                            && !b.king_in_check(color)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn is_checkmate(&self, color: PieceColor) -> bool {
+        self.king_in_check(color) && !self.has_legal_moves(color)
+    }
+
+    fn is_stalemate(&self, color: PieceColor) -> bool {
+        !self.king_in_check(color) && !self.has_legal_moves(color)
+    }
+
     fn build_san(
         &self,
         ff: u8,
@@ -839,14 +893,19 @@ pub fn register(ctx: &ReducerContext, username: String, password: String) -> Res
     }
 
     let user = ctx.db.user().insert(User {
-        user_id: 0,
+        id: 0,
         username: username.clone(),
         password_hash: hash_password(&ctx, &password)?,
+        created_at: ctx.timestamp,
+        last_login: ctx.timestamp,
+    });
+
+    ctx.db.player().insert(Player {
+        id: user.id,
+        name: username.clone(),
         wins: 0,
         losses: 0,
         draws: 0,
-        created_at: ctx.timestamp,
-        last_login: ctx.timestamp,
     });
 
     // Auto-login: replace any stale session for this connection
@@ -855,11 +914,11 @@ pub fn register(ctx: &ReducerContext, username: String, password: String) -> Res
     }
     ctx.db.session().insert(Session {
         identity: ctx.sender(),
-        user_id: user.user_id,
+        user_id: user.id,
         logged_in_at: ctx.timestamp,
     });
 
-    log::info!("Registered '{}' (user_id={})", username, user.user_id);
+    log::info!("Registered '{}' (user_id={})", username, user.id);
     Ok(())
 }
 
@@ -882,17 +941,17 @@ pub fn login(ctx: &ReducerContext, username: String, password: String) -> Result
     }
     ctx.db.session().insert(Session {
         identity: ctx.sender(),
-        user_id: user.user_id,
+        user_id: user.id,
         logged_in_at: ctx.timestamp,
     });
 
     // update last login
-    ctx.db.user().user_id().update(User {
+    ctx.db.user().id().update(User {
         last_login: ctx.timestamp,
         ..user
     });
 
-    log::info!("User '{}' logged in (user_id={})", username, user.user_id);
+    log::info!("User '{}' logged in (user_id={})", username, user.id);
 
     Ok(())
 }
@@ -924,7 +983,7 @@ pub fn change_password(
         return Err("New password must differ from current password".to_string());
     }
     let pwd_hash = hash_password(&ctx, &new_password)?;
-    ctx.db.user().user_id().update(User {
+    ctx.db.user().id().update(User {
         password_hash: pwd_hash.to_string(),
         ..user
     });
@@ -940,7 +999,7 @@ pub fn join_lobby(ctx: &ReducerContext) -> Result<(), String> {
     let user = require_auth(ctx)?;
 
     for entry in ctx.db.lobby_entry().iter() {
-        if entry.user_id == user.user_id && entry.status == LobbyStatus::Open {
+        if entry.player_id == user.id && entry.status == LobbyStatus::Open {
             return Err("Already in lobby".to_string());
         }
     }
@@ -949,22 +1008,22 @@ pub fn join_lobby(ctx: &ReducerContext) -> Result<(), String> {
         .db
         .lobby_entry()
         .iter()
-        .find(|e| e.status == LobbyStatus::Open && e.user_id != user.user_id);
+        .find(|e| e.status == LobbyStatus::Open && e.player_id != user.id);
 
     if let Some(opp) = opponent {
-        let (white_user_id, white_username, black_user_id, black_username) =
+        let (white_player_id, white_player_name, black_player_id, black_player_name) =
             if ctx.rng().next_u64() % 2 == 0 {
                 (
-                    user.user_id,
+                    user.id,
                     user.username.clone(),
-                    opp.user_id,
-                    opp.username.clone(),
+                    opp.id,
+                    opp.player_name.clone(),
                 )
             } else {
                 (
-                    opp.user_id,
-                    opp.username.clone(),
-                    user.user_id,
+                    opp.player_id,
+                    opp.player_name.clone(),
+                    user.id,
                     user.username.clone(),
                 )
             };
@@ -975,29 +1034,29 @@ pub fn join_lobby(ctx: &ReducerContext) -> Result<(), String> {
         });
         ctx.db.lobby_entry().insert(LobbyEntry {
             id: 0,
-            user_id: user.user_id,
-            username: user.username.clone(),
+            player_id: user.id,
+            player_name: user.username.clone(),
             status: LobbyStatus::Matched,
             joined_at: ctx.timestamp,
         });
         ctx.db.game().insert(Game {
             id: 0,
-            white_user_id,
-            black_user_id,
-            white_username,
-            black_username,
+            white_player_id,
+            black_player_id,
+            white_player_name,
+            black_player_name,
             fen: STARTING_FEN.to_string(),
             status: GameStatus::InProgress,
             turn: PieceColor::White,
             created_at: ctx.timestamp,
             updated_at: ctx.timestamp,
-            winner_user_id: None,
+            winner_player_id: None,
         });
     } else {
         ctx.db.lobby_entry().insert(LobbyEntry {
             id: 0,
-            user_id: user.user_id,
-            username: user.username.clone(),
+            player_id: user.id,
+            player_name: user.username.clone(),
             status: LobbyStatus::Open,
             joined_at: ctx.timestamp,
         });
@@ -1013,7 +1072,7 @@ pub fn leave_lobby(ctx: &ReducerContext) -> Result<(), String> {
         .db
         .lobby_entry()
         .iter()
-        .find(|e| e.user_id == user.user_id && e.status == LobbyStatus::Open)
+        .find(|e| e.player_id == user.id && e.status == LobbyStatus::Open)
         .ok_or("Not in lobby")?;
     ctx.db.lobby_entry().id().update(LobbyEntry {
         status: LobbyStatus::Cancelled,
@@ -1042,9 +1101,9 @@ pub fn make_move(
     if game.status != GameStatus::InProgress {
         return Err("Game is not in progress".to_string());
     }
-    let player_color = if user.user_id == game.white_user_id {
+    let player_color = if user.id == game.white_player_id {
         PieceColor::White
-    } else if user.user_id == game.black_user_id {
+    } else if user.id == game.black_player_id {
         PieceColor::Black
     } else {
         return Err("You are not a player in this game".to_string());
@@ -1067,6 +1126,11 @@ pub fn make_move(
         .get(from_file, from_rank)
         .cloned()
         .ok_or("No piece at source square")?;
+
+    if moving_piece.color != player_color {
+        return Err("That is not your piece".to_string());
+    }
+
     let (captured, is_ep, is_castle) =
         board.apply_move(from_file, from_rank, to_file, to_rank, promo_kind)?;
 
@@ -1079,7 +1143,8 @@ pub fn make_move(
         PieceColor::Black => PieceColor::White,
     };
     let is_check = board.king_in_check(opp);
-    let is_checkmate = false; // Full legal-move gen needed — extension point
+    let is_checkmate = board.is_checkmate(opp);
+    let is_stalemate = board.is_stalemate(opp);
 
     let ply = ctx
         .db
@@ -1088,6 +1153,7 @@ pub fn make_move(
         .filter(&game_id)
         .count() as u32
         + 1;
+
     let san = Board::from_fen(&game.fen).unwrap().build_san(
         from_file,
         from_rank,
@@ -1106,7 +1172,7 @@ pub fn make_move(
         id: 0,
         game_id,
         ply,
-        user_id: user.user_id,
+        player_id: user.id,
         from_file,
         from_rank,
         to_file,
@@ -1129,21 +1195,21 @@ pub fn make_move(
         fen: board.to_fen(),
         status: if is_checkmate {
             GameStatus::Checkmate
+        } else if is_stalemate {
+            GameStatus::Stalemate
         } else {
             GameStatus::InProgress
         },
         turn: new_turn,
         updated_at: ctx.timestamp,
-        winner_user_id: if is_checkmate {
-            Some(user.user_id)
-        } else {
-            None
-        },
+        winner_player_id: if is_checkmate { Some(user.id) } else { None },
         ..game
     });
-
     if is_checkmate {
-        record_result(ctx, game_id, Some(user.user_id));
+        record_result(ctx, game_id, Some(user.id));
+    }
+    if is_stalemate {
+        record_result(ctx, game_id, None);
     }
     Ok(())
 }
@@ -1155,7 +1221,7 @@ pub fn offer_draw(ctx: &ReducerContext, game_id: u64) -> Result<(), String> {
     if game.status != GameStatus::InProgress {
         return Err("Game is not in progress".to_string());
     }
-    if user.user_id != game.white_user_id && user.user_id != game.black_user_id {
+    if user.id != game.white_player_id && user.id != game.black_player_id {
         return Err("Not a player in this game".to_string());
     }
 
@@ -1163,7 +1229,7 @@ pub fn offer_draw(ctx: &ReducerContext, game_id: u64) -> Result<(), String> {
         .db
         .draw_offer()
         .iter()
-        .any(|o| o.game_id == game_id && o.offered_by_user_id != user.user_id);
+        .any(|o| o.game_id == game_id && o.offered_by_player_id != user.id);
 
     if opponent_offered {
         ctx.db.game().id().update(Game {
@@ -1185,7 +1251,7 @@ pub fn offer_draw(ctx: &ReducerContext, game_id: u64) -> Result<(), String> {
         ctx.db.draw_offer().insert(DrawOffer {
             id: 0,
             game_id,
-            offered_by_user_id: user.user_id,
+            offered_by_player_id: user.id,
             offered_at: ctx.timestamp,
         });
     }
@@ -1199,16 +1265,16 @@ pub fn resign(ctx: &ReducerContext, game_id: u64) -> Result<(), String> {
     if game.status != GameStatus::InProgress {
         return Err("Game is not in progress".to_string());
     }
-    let winner = if user.user_id == game.white_user_id {
-        game.black_user_id
-    } else if user.user_id == game.black_user_id {
-        game.white_user_id
+    let winner = if user.id == game.white_player_id {
+        game.black_player_id
+    } else if user.id == game.black_player_id {
+        game.white_player_id
     } else {
         return Err("Not a player in this game".to_string());
     };
     ctx.db.game().id().update(Game {
         status: GameStatus::Resigned,
-        winner_user_id: Some(winner),
+        winner_player_id: Some(winner),
         updated_at: ctx.timestamp,
         ..game
     });
@@ -1229,15 +1295,15 @@ pub fn spectate_game(ctx: &ReducerContext, game_id: u64) -> Result<(), String> {
         .spectator()
         .spectators_by_game()
         .filter(&game_id)
-        .any(|s| s.user_id == user.user_id)
+        .any(|s| s.player_id == user.id)
     {
         return Err("Already spectating".to_string());
     }
     ctx.db.spectator().insert(Spectator {
         id: 0,
         game_id,
-        user_id: user.user_id,
-        username: user.username,
+        player_id: user.id,
+        player_name: user.username,
         joined_at: ctx.timestamp,
     });
     Ok(())
@@ -1251,7 +1317,7 @@ pub fn leave_spectate(ctx: &ReducerContext, game_id: u64) -> Result<(), String> 
         .spectator()
         .spectators_by_game()
         .filter(&game_id)
-        .find(|s| s.user_id == user.user_id)
+        .find(|s| s.player_id == user.id)
         .ok_or("Not spectating this game")?;
     ctx.db.spectator().id().delete(&entry.id);
     Ok(())
@@ -1273,8 +1339,8 @@ pub fn send_chat(ctx: &ReducerContext, game_id: u64, text: String) -> Result<(),
     ctx.db.chat_message().insert(ChatMessage {
         id: 0,
         game_id,
-        user_id: user.user_id,
-        sender_name: user.username,
+        player_id: user.id,
+        player_name: user.username,
         text,
         sent_at: ctx.timestamp,
     });
@@ -1285,34 +1351,34 @@ pub fn send_chat(ctx: &ReducerContext, game_id: u64, text: String) -> Result<(),
 //  HELPERS
 // ─────────────────────────────────────────────
 
-fn record_result(ctx: &ReducerContext, game_id: u64, winner_user_id: Option<u64>) {
+fn record_result(ctx: &ReducerContext, game_id: u64, winner_player_id: Option<u64>) {
     let game = match ctx.db.game().id().find(&game_id) {
         Some(g) => g,
         None => return,
     };
     let update = |uid: u64, win: bool, draw: bool| {
-        if let Some(u) = ctx.db.user().user_id().find(&uid) {
-            ctx.db.user().user_id().update(User {
-                wins: u.wins + if win { 1 } else { 0 },
-                losses: u.losses + if !win && !draw { 1 } else { 0 },
-                draws: u.draws + if draw { 1 } else { 0 },
-                ..u
+        if let Some(p) = ctx.db.player().id().find(&uid) {
+            ctx.db.player().id().update(Player {
+                wins: p.wins + if win { 1 } else { 0 },
+                losses: p.losses + if !win && !draw { 1 } else { 0 },
+                draws: p.draws + if draw { 1 } else { 0 },
+                ..p
             });
         }
     };
-    match winner_user_id {
+    match winner_player_id {
         Some(w) => {
-            let loser = if w == game.white_user_id {
-                game.black_user_id
+            let loser = if w == game.white_player_id {
+                game.black_player_id
             } else {
-                game.white_user_id
+                game.white_player_id
             };
             update(w, true, false);
             update(loser, false, false);
         }
         None => {
-            update(game.white_user_id, false, true);
-            update(game.black_user_id, false, true);
+            update(game.white_player_id, false, true);
+            update(game.black_player_id, false, true);
         }
     }
 }
