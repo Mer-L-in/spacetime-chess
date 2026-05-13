@@ -2,7 +2,9 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use spacetimedb::{rand::RngCore, ReducerContext, SpacetimeType, Table, Timestamp};
+use spacetimedb::{
+    rand::RngCore, view, ReducerContext, SpacetimeType, Table, Timestamp, ViewContext,
+};
 
 // ─────────────────────────────────────────────
 //  CUSTOM TYPES
@@ -75,7 +77,7 @@ pub struct Player {
 }
 
 /// Active session — maps a SpacetimeDB Identity (connection) to a User account.
-#[spacetimedb::table(accessor = session, public)]
+#[spacetimedb::table(accessor = session)]
 pub struct Session {
     #[primary_key]
     pub identity: spacetimedb::Identity,
@@ -872,6 +874,11 @@ pub fn identity_disconnected(ctx: &ReducerContext) {
 // ─────────────────────────────────────────────
 //  AUTH REDUCERS
 // ─────────────────────────────────────────────
+
+#[view(accessor = my_session, public)]
+fn my_session(ctx: &ViewContext) -> Option<Session> {
+    ctx.db.session().identity().find(&ctx.sender())
+}
 
 /// Create a new account and immediately log in.
 #[spacetimedb::reducer]

@@ -232,11 +232,11 @@ fn main() {
                     .add_query(|q| q.from.move_record())
                     .add_query(|q| q.from.spectator())
                     .add_query(|q| q.from.chat_message())
-                    .add_query(|q| q.from.session())
+                    .add_query(|q| q.from.my_session())
                     .subscribe();
 
                 // AUTH EVENTS
-                ctx.db().session().on_insert({
+                ctx.db().my_session().on_insert({
                     let state = state_for_connect.clone();
                     let conn_holder = conn_holder_clone.clone();
                     move |_ctx, session| {
@@ -262,7 +262,7 @@ fn main() {
                     }
                 });
 
-                ctx.db().session().on_delete({
+                ctx.db().my_session().on_delete({
                     let state = state_for_connect.clone();
                     move |_ctx, session| {
                         let mut st = state.lock().unwrap();
